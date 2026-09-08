@@ -1,0 +1,605 @@
+diff --git a/frontend/build-versions.json b/frontend/build-versions.json
+index 8239f8c..d58e39e 100644
+--- a/frontend/build-versions.json
++++ b/frontend/build-versions.json
+@@ -1,5 +1,5 @@
+ {
+-  "assets": 362,
++  "assets": 363,
+   "serviceWorker": 8,
+   "notificationIcons": 4
+ }
+diff --git a/frontend/src/App.svelte b/frontend/src/App.svelte
+index 7a3b85e..bd88171 100644
+--- a/frontend/src/App.svelte
++++ b/frontend/src/App.svelte
+@@ -417,7 +417,12 @@
+     if (relayStore.deviceCredential(agent.relay_id)?.role !== 'reader') {
+       void relayStore.acknowledgePane(agent);
+     }
+-    navigate({ view: 'terminal', paneId: agent.pane_id, target: targetRefForAgent(agent) || undefined });
++    const connection = $connections.get(agent.relay_id);
++    const view = agent.conversation_history_available
++      && connection?.capabilities.includes('conversation_history')
++      ? 'history'
++      : 'terminal';
++    navigate({ view, paneId: agent.pane_id, target: targetRefForAgent(agent) || undefined });
+   }
+ 
+   function toggle(view: 'settings' | 'launch' | 'activity' | 'workspaces') {
+@@ -588,8 +593,8 @@
+         <Button
+           variant="ghost"
+           size="icon"
+-          aria-label="Terminal view"
+-          title="Terminal view"
++          aria-label="Interactive terminal"
++          title="Interactive terminal — temporarily resizes the shared desktop pane"
+           disabled={!activeAgent}
+           onclick={() => { if (activeAgent) replaceView({ view: 'terminal', paneId: activeAgent.pane_id, target: targetRefForAgent(activeAgent) || undefined }); }}
+         >
+@@ -645,7 +650,7 @@
+          the view: the reply draft, transcript, and scroll pin are all per-pane
+          state and must never carry over to a different agent. -->
+     {#key activeAgent.pane_id}
+-      <ConversationHistory agent={activeAgent} readOnly={activeReadOnly} />
++      <ConversationHistory agent={activeAgent} frame={$frames.get(activeAgent.pane_id)} readOnly={activeReadOnly} />
+     {/key}
+   {:else if $currentView.view === 'history'}
+     <main class="page terminal-loading" aria-label="Conversation history unavailable">
+diff --git a/frontend/src/app.css b/frontend/src/app.css
+index 2b7d960..4a29ec3 100644
+--- a/frontend/src/app.css
++++ b/frontend/src/app.css
+@@ -966,6 +966,24 @@ textarea { min-height: 6.5rem; resize: vertical; }
+   .workspace-body { grid-template-columns: minmax(8rem, 42%) minmax(0, 1fr); }
+   .workspace-toolbar { align-items: stretch; }
+   .workspace-search { flex-basis: 100%; order: 2; }
++  .terminal-view:not(.question-only) .term-keys:not(.question-term-keys) {
++    align-items: stretch;
++    display: grid;
++    grid-template-columns: repeat(5, minmax(0, 1fr));
++  }
++  .terminal-view:not(.question-only) .term-keys:not(.question-term-keys) > .spacer { display: none; }
++  .terminal-view:not(.question-only) .term-keys:not(.question-term-keys) > .modifier-menu { display: contents; }
++  .terminal-view:not(.question-only) .term-keys:not(.question-term-keys) > .button,
++  .terminal-view:not(.question-only) .term-keys:not(.question-term-keys) > .modifier-menu > .button,
++  .terminal-view:not(.question-only) .term-keys:not(.question-term-keys) > .fkey-menu,
++  .terminal-view:not(.question-only) .term-keys:not(.question-term-keys) > .arrow-menu {
++    min-width: 0;
++    width: 100%;
++  }
++  .terminal-view:not(.question-only) .term-keys:not(.question-term-keys) > .fkey-menu > .button,
++  .terminal-view:not(.question-only) .term-keys:not(.question-term-keys) > .arrow-menu > .button {
++    width: 100%;
++  }
+ }
+ 
+ @media (min-width: 680px) and (max-width: 899px) {
+diff --git a/frontend/src/components/ConversationHistory.svelte b/frontend/src/components/ConversationHistory.svelte
+index 2db74b9..b687c98 100644
+--- a/frontend/src/components/ConversationHistory.svelte
++++ b/frontend/src/components/ConversationHistory.svelte
+@@ -21,9 +21,9 @@
+   import { clearPromptDraft, loadPromptDraft, savePromptDraft } from '$lib/prompt-drafts';
+   import { relayStore } from '$lib/store';
+   import type { AttachmentBatchController, AttachmentBatchSnapshot, AttachmentRef } from '$lib/attachments';
+-  import type { Agent, ConversationEntry, OmoTodoState } from '$lib/types';
++  import type { Agent, ConversationEntry, OmoTodoState, TerminalFrame } from '$lib/types';
+ 
+-  let { agent, readOnly = false }: { agent: Agent; readOnly?: boolean } = $props();
++  let { agent, frame, readOnly = false }: { agent: Agent; frame?: TerminalFrame; readOnly?: boolean } = $props();
+ 
+   const connections = relayStore.connections;
+ 
+@@ -62,6 +62,16 @@
+   let pinnedToBottom = $state(true);
+   let mounted = false;
+ 
++  let pollTimer: ReturnType<typeof setInterval> | null = null;
++  let frameRefreshTimer: ReturnType<typeof setTimeout> | null = null;
++  let promptRefreshTimer: ReturnType<typeof setTimeout> | null = null;
++  let latestLoad: Promise<void> | null = null;
++  let latestLoadQueued = false;
++  let paneMounted = false;
++  let frameInitialized = false;
++  const FOREGROUND_REFRESH_MS = 5_000;
++  const BACKGROUND_REFRESH_MS = 30_000;
++  const FRAME_REFRESH_DEBOUNCE_MS = 750;
+   const modeEntries = $derived(mode === 'conversation' ? conversationEntries(entries) : entries);
+   const inputLocked = $derived(readOnly || agentNeedsResponse(agent) || agentNeedsInspection(agent));
+   const inputPlaceholder = $derived(readOnly
+@@ -80,14 +90,114 @@
+     ].join(' ').toLocaleLowerCase().includes(needle));
+   });
+ 
++  function startPolling() {
++    if (!mounted) return;
++    if (pollTimer !== null) clearInterval(pollTimer);
++    const interval = document.visibilityState === 'visible'
++      ? FOREGROUND_REFRESH_MS
++      : BACKGROUND_REFRESH_MS;
++    pollTimer = setInterval(() => { requestLatestLoad(); }, interval);
++  }
++
++  function requestLatestLoad() {
++    if (!mounted) return;
++    if (latestLoad) {
++      latestLoadQueued = true;
++      return;
++    }
++    const request = loadLatest();
++    latestLoad = request;
++    const finish = () => {
++      if (latestLoad !== request) return;
++      latestLoad = null;
++      if (!mounted) {
++        latestLoadQueued = false;
++        return;
++      }
++      if (!latestLoadQueued) return;
++      latestLoadQueued = false;
++      if (document.visibilityState !== 'visible') return;
++      requestLatestLoad();
++    };
++    void request.then(finish, finish);
++  }
++
++  function clearFrameRefreshTimer() {
++    if (frameRefreshTimer === null) return;
++    clearTimeout(frameRefreshTimer);
++    frameRefreshTimer = null;
++  }
++
++  function queueFrameRefresh() {
++    if (!mounted || document.visibilityState !== 'visible' || frameRefreshTimer !== null) return;
++    frameRefreshTimer = setTimeout(() => {
++      frameRefreshTimer = null;
++      requestLatestLoad();
++    }, FRAME_REFRESH_DEBOUNCE_MS);
++  }
++
++  function queuePromptRefresh() {
++    if (!mounted) return;
++    if (promptRefreshTimer !== null) clearTimeout(promptRefreshTimer);
++    promptRefreshTimer = setTimeout(() => {
++      promptRefreshTimer = null;
++      requestLatestLoad();
++    }, 500);
++  }
++
++  function mountPane() {
++    if (paneMounted) return;
++    paneMounted = true;
++    relayStore.readPane(agent);
++    relayStore.watchPane(agent);
++  }
++
++  function unmountPane() {
++    if (!paneMounted) return;
++    paneMounted = false;
++    relayStore.unwatchPane(agent);
++  }
++
++  function clearRefreshTimers() {
++    if (pollTimer !== null) {
++      clearInterval(pollTimer);
++      pollTimer = null;
++    }
++    clearFrameRefreshTimer();
++    if (promptRefreshTimer !== null) {
++      clearTimeout(promptRefreshTimer);
++      promptRefreshTimer = null;
++    }
++  }
++
++  $effect(() => {
++    const nextFrame = frame;
++    if (!frameInitialized) {
++      frameInitialized = true;
++      return;
++    }
++    if (nextFrame?.paneId === agent.pane_id) queueFrameRefresh();
++  });
++
+   onMount(() => {
+     mode = localStorage.getItem('herdr-conversation-view') === 'activity' ? 'activity' : 'conversation';
+     mounted = true;
+-    void loadLatest();
+-    const refresh = setInterval(() => { void loadLatest(); }, 5_000);
++    mountPane();
++    requestLatestLoad();
++    startPolling();
++    const visibilityChanged = () => {
++      if (!mounted) return;
++      if (document.visibilityState !== 'visible') clearFrameRefreshTimer();
++      startPolling();
++      if (document.visibilityState === 'visible') requestLatestLoad();
++    };
++    document.addEventListener('visibilitychange', visibilityChanged);
+     return () => {
+       mounted = false;
+-      clearInterval(refresh);
++      latestLoadQueued = false;
++      clearRefreshTimers();
++      document.removeEventListener('visibilitychange', visibilityChanged);
++      unmountPane();
+     };
+   });
+ 
+@@ -139,6 +249,7 @@
+   }
+ 
+   async function loadLatest() {
++    if (!mounted) return;
+     try {
+       const page = await relayStore.getConversationHistory(agent);
+       if (!mounted) return;
+@@ -299,7 +410,7 @@
+       await relayStore.sendToAgent(agent, { type: 'submit_prompt', text });
+       relayStore.showToast('Prompt sent.');
+       clearUploadStatus();
+-      setTimeout(() => { void loadLatest(); }, 500);
++      queuePromptRefresh();
+     } catch (failure) {
+       const dispatchedUnknown = typeof failure === 'object'
+         && failure !== null
+diff --git a/frontend/src/components/TerminalView.svelte b/frontend/src/components/TerminalView.svelte
+index e04fdcd..f979f5a 100644
+--- a/frontend/src/components/TerminalView.svelte
++++ b/frontend/src/components/TerminalView.svelte
+@@ -2381,6 +2381,7 @@
+     <div class="term-keys" aria-busy={keySending}>
+       <Button variant="secondary" size="sm" disabled={readOnly || keySending} onpointerdown={(event) => event.preventDefault()} onclick={() => sendTerminalKey('Escape', 'Cancelled prompt')}>Esc</Button>
+       <Button variant="secondary" size="sm" disabled={readOnly || keySending} aria-label="Tab" title="Send Tab" onpointerdown={(event) => event.preventDefault()} onclick={sendTab}>{@render tabIcon()}</Button>
++      <Button variant="secondary" size="sm" disabled={readOnly || keySending} aria-label="Backspace" title="Send Backspace" onpointerdown={(event) => event.preventDefault()} onclick={() => sendTerminalKey('Backspace')}>⌫</Button>
+       <div class="modifier-menu">
+         <input
+           id="modifier-key-input"
+diff --git a/frontend/tests/browser/mobile-journeys.spec.ts b/frontend/tests/browser/mobile-journeys.spec.ts
+index 5213440..6ef59bf 100644
+--- a/frontend/tests/browser/mobile-journeys.spec.ts
++++ b/frontend/tests/browser/mobile-journeys.spec.ts
+@@ -612,7 +612,7 @@ test('manages workspace modals, grouped worktrees, and drag ordering', async ({
+   await worktreeDialog.getByRole('button', { name: 'Cancel' }).click();
+   await expect(worktreeDialog).toBeHidden();
+ 
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+   await expect(page.locator('.workspace-worktree-card')).toContainText('fix/one');
+   await page.getByRole('button', { name: 'Manage workspaces' }).click();
+   await expect(page.locator('#workspace-manager-title')).toBeVisible();
+@@ -754,7 +754,7 @@ test('defaults to the mixed workspace layout and separates state sections on dem
+   // By State: sections separated by state, done first after the input queue.
+   await page.getByRole('button', { name: /Settings/ }).click();
+   await page.getByRole('button', { name: 'By State' }).click();
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+   const done = page.locator('.done-section');
+   await expect(done.getByRole('heading', { name: 'Done' })).toBeVisible();
+   await expect(done.locator('summary strong')).toHaveText(['alpha']);
+@@ -768,7 +768,7 @@ test('defaults to the mixed workspace layout and separates state sections on dem
+   // Back to the mixed default.
+   await page.getByRole('button', { name: /Settings/ }).click();
+   await page.getByRole('button', { name: 'Mixed' }).click();
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+   await expect(page.getByRole('heading', { name: 'Done' })).toBeHidden();
+   await expect(page.getByRole('region', { name: 'Workspaces' })).toBeVisible();
+ });
+@@ -1061,7 +1061,7 @@ test('keeps an opened workspace expanded across tab navigation and inventory ref
+   await expect(workspace).toHaveAttribute('open', '');
+   await workspace.getByRole('button', { name: 'Open Mobile app on Fedora' }).click();
+   await expect(page.getByRole('combobox', { name: 'Prompt' })).toBeVisible();
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+   await expect(workspace).toHaveAttribute('open', '');
+ 
+ 
+@@ -1094,7 +1094,7 @@ test('reconnects and blocks mutations for an incompatible relay protocol', async
+   await expect(removeDialog).toContainText('You will need its setup link or connection details to add it again.');
+   await removeDialog.getByRole('button', { name: 'Cancel' }).click();
+   await expect(page.getByText('wss://fedora.example')).toBeVisible();
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+   await page.getByRole('button', { name: 'Approve once' }).click();
+   await expect(page.getByRole('status').filter({ hasText: /protocol v1/ })).toBeVisible();
+   expect((await commands(page)).filter((command) => command.type === 'respond')).toHaveLength(0);
+@@ -2706,7 +2706,7 @@ test('reads a response aloud in the language the relay has a voice for', async (
+   await expect(page.getByRole('switch', { name: 'Read Responses Aloud' })).toBeChecked();
+   await page.getByLabel('Language').selectOption('fr');
+   await expect(page.getByRole('status').filter({ hasText: 'No French voice on Fedora' })).toBeVisible();
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+ 
+   await page.getByRole('button', { name: 'Open Spoken output on Fedora' }).click();
+   await server(page, 0, {
+@@ -3163,7 +3163,7 @@ test('leases measured terminal columns and releases on teardown', async ({ page
+   });
+   await expect(terminal.locator('.term-screen')).toHaveAttribute('data-terminal-row-count', '120');
+ 
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+   await expect.poll(async () => (await commands(page))
+     .filter((command) => command.type === 'release_pane_size').length).toBe(1);
+   const release = (await commands(page)).find((command) => command.type === 'release_pane_size')!;
+@@ -3244,7 +3244,7 @@ test('leases measured terminal columns and releases on teardown', async ({ page
+   await expect(terminal).toContainText('stored resize history row 120');
+ 
+   await setAutoCommands(page, true);
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+   await expect.poll(async () => (await commands(page))
+     .filter((command) => command.type === 'release_pane_size').length).toBe(2);
+ });
+@@ -3317,7 +3317,7 @@ test('paints again when a re-entry lease never lands', async ({ page }) => {
+   await expect.poll(async () => (await commands(page))
+     .filter((command) => command.type === 'lease_pane_size').length).toBe(1);
+ 
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+   await expect.poll(async () => (await commands(page))
+     .filter((command) => command.type === 'release_pane_size').length).toBe(1);
+   await setAutoCommands(page, false);
+@@ -3656,7 +3656,7 @@ test('surfaces one explicit error when a pane-size lease fails', async ({ page }
+   await expect(page.getByRole('alert')).toHaveText('Resize Session failed: pane resize denied');
+ 
+   await setAutoCommands(page, true);
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+   await expect.poll(async () => (await commands(page))
+     .filter((command) => command.type === 'release_pane_size').length).toBe(1);
+ });
+@@ -3754,8 +3754,9 @@ test('reads and replies from native conversation history', async ({ page }) => {
+   });
+ 
+   await page.getByRole('button', { name: 'Open History app on Fedora' }).click();
+-  await page.getByRole('button', { name: 'Conversation history' }).click();
+   await expect(page.getByRole('heading', { name: 'Conversation', exact: true })).toBeVisible();
++  await expect(page.getByRole('button', { name: 'Interactive terminal' }))
++    .toHaveAttribute('title', /temporarily resizes the shared desktop pane/);
+   await expect(page.getByText('middle retained answer')).toBeVisible();
+   await expect(page.getByText('latest retained question')).toBeVisible();
+   await expect(page.getByText('4 recorded messages')).toBeVisible();
+@@ -3873,13 +3874,29 @@ test('reads and replies from native conversation history', async ({ page }) => {
+   await expect(composer).toBeDisabled();
+   await expect(page.getByText('Switch to Terminal to handle the pending agent interaction.')).toBeVisible();
+ 
+-  await page.getByRole('button', { name: 'Terminal view' }).click();
++  await page.getByRole('button', { name: 'Interactive terminal' }).click();
+   await expect(page.getByRole('combobox', { name: 'Prompt' })).toBeVisible();
+   await page.getByRole('button', { name: 'Conversation history' }).click();
+   await expect(page.getByRole('textbox', { name: 'Prompt' })).toBeVisible();
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+   await expect(page.getByRole('button', { name: 'Open History app on Fedora' })).toBeVisible();
+ });
++test('falls back to the interactive terminal when conversation history is unavailable', async ({ page }) => {
++  await boot(page, [fedora]);
++  await expect.poll(() => socketCount(page)).toBe(1);
++  await handshake(page, 0, { capabilities: ['attention_classification'] });
++  await server(page, 0, {
++    type: 'agents',
++    agents: [{
++      pane_id: 'w1:p1', status: 'working', project: 'Legacy app', agent: 'codex',
++      conversation_history_available: true,
++    }],
++  });
++  await page.getByRole('button', { name: 'Open Legacy app on Fedora' }).click();
++  await expect(page.getByRole('main', { name: 'Terminal for Legacy app' })).toBeVisible();
++  await expect(page.getByRole('button', { name: 'Conversation history' })).toBeDisabled();
++});
++
+ 
+ test('shows tool-only agent turns only in full history and decodes their arguments', async ({ page }) => {
+   await boot(page, [fedora]);
+@@ -3935,7 +3952,6 @@ test('shows tool-only agent turns only in full history and decodes their argumen
+   });
+ 
+   await page.getByRole('button', { name: 'Open Tool history on Fedora' }).click();
+-  await page.getByRole('button', { name: 'Conversation history' }).click();
+   await expect(page.getByRole('heading', { name: 'Conversation', exact: true })).toBeVisible();
+   await expect(page.getByText('Probe finished.')).toBeVisible();
+ 
+@@ -4018,7 +4034,6 @@ test('opens a long conversation at its newest turn and holds the pin', async ({
+   await setConversationFixture(page, { entries, total: entries.length });
+ 
+   await page.getByRole('button', { name: 'Open Long conversation on Fedora' }).click();
+-  await page.getByRole('button', { name: 'Conversation history' }).click();
+   const list = page.locator('.conversation-list');
+   const bottomGap = () => list.evaluate((element) =>
+     element.scrollHeight - element.scrollTop - element.clientHeight);
+@@ -4390,7 +4405,7 @@ test('discovers slash commands per terminal and fills them before sending', asyn
+     pane_id: 'w1:p1', text: '/plan Review the release',
+   });
+ 
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+   await page.getByRole('button', { name: 'Search all agents' }).click();
+   await jump.getByRole('searchbox', { name: 'Search agents and workspaces' }).fill('Claude app');
+   await jump.getByRole('button', { name: /Claude app/ }).click();
+@@ -4441,7 +4456,7 @@ test('scales the whole interface from accessible settings', async ({ page }) =>
+     type: 'agents',
+     agents: [{ pane_id: 'w1:p1', status: 'idle', project: 'History app', agent: 'codex' }],
+   });
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+   await page.getByRole('button', { name: 'Open History app on Fedora' }).click();
+   await expect.poll(async () => (await commands(page))
+     .some((command) => command.type === 'read_pane' && command.lines === 500)).toBe(true);
+@@ -4481,13 +4496,13 @@ test('scales and expands the prompt composer for multiline text', async ({ page
+   await page.getByRole('button', { name: 'Settings' }).click();
+   const sizes = page.getByRole('group', { name: 'Interface Size' });
+   await sizes.getByRole('button', { name: 'Regular' }).click();
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+   await composer.fill('One line');
+   const regularHeight = (await composer.boundingBox())!.height;
+ 
+   await page.getByRole('button', { name: 'Settings' }).click();
+   await sizes.getByRole('button', { name: 'Large' }).click();
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+   await composer.fill('One line');
+   const largeHeight = (await composer.boundingBox())!.height;
+ 
+@@ -5129,7 +5144,7 @@ test('refreshes agents on return home and preserves shared terminal behavior', a
+   await expect(shiftKey).toHaveAttribute('aria-pressed', 'false');
+   await expect(modifierLetter).not.toBeFocused();
+   const refreshesBeforeBack = (await commands(page)).filter((command) => command.type === 'refresh_agents').length;
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+   await expect.poll(async () => (await commands(page)).filter((command) => command.type === 'refresh_agents').length)
+     .toBe(refreshesBeforeBack + 1);
+   await server(page, 0, { type: 'agents', agents: [{ pane_id: 'w1:p1', status: 'working', project: 'Terminal app', agent: 'opencode', server_session_id: 'session-1', terminal_id: 'terminal-1', generation: 1 }] });
+@@ -5749,7 +5764,7 @@ test('keeps a saved draft across a hidden prompt but never persists what it hide
+     no_echo: true, no_echo_prompt: '[sudo] password for cv:',
+   });
+   await expect(page.getByRole('region', { name: 'Hidden terminal prompt' })).toBeVisible();
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+   prompt = await openTerminal();
+   await expect(prompt).toHaveValue('half-written instructions');
+ 
+@@ -5764,7 +5779,7 @@ test('keeps a saved draft across a hidden prompt but never persists what it hide
+   await expect(page.getByText('Not saved on this phone')).toBeVisible();
+   expect(await page.evaluate(() => JSON.stringify(localStorage))).not.toContain('hunter2');
+ 
+-  await page.getByRole('button', { name: 'Back' }).click();
++  await page.getByRole('button', { name: 'Back', exact: true }).click();
+   prompt = await openTerminal();
+   await expect(prompt).toHaveValue('half-written instructions');
+ });
+diff --git a/frontend/tests/unit/components.test.ts b/frontend/tests/unit/components.test.ts
+index e8499ee..8759f36 100644
+--- a/frontend/tests/unit/components.test.ts
++++ b/frontend/tests/unit/components.test.ts
+@@ -674,4 +674,128 @@ describe('accessible Svelte interactions', () => {
+       vi.restoreAllMocks();
+     }
+   });
++  it('sends Backspace from the normal terminal keys and disables it for readers', async () => {
++    const user = userEvent.setup();
++    const agent: Agent = {
++      relay_id: 'fedora', relay_label: 'Fedora', raw_pane_id: 'w1:backspace', pane_id: 'fedora::w1:backspace',
++      project: 'relay', agent: 'codex', status: 'working',
++    };
++    vi.spyOn(relayStore, 'readPane').mockImplementation(() => undefined);
++    vi.spyOn(relayStore, 'watchPane').mockImplementation(() => undefined);
++    vi.spyOn(relayStore, 'unwatchPane').mockImplementation(() => undefined);
++    vi.spyOn(relayStore, 'loadSlashCommands').mockResolvedValue({ commands: [], truncated: false });
++    const send = vi.spyOn(relayStore, 'sendToAgent').mockResolvedValue({
++      type: 'command_result', request_id: 'backspace-1', ok: true,
++    });
++    try {
++      const view = render(TerminalView, {
++        agent,
++        allAgents: [agent],
++        frame: { paneId: agent.pane_id, content: 'ready', format: 'plain' },
++        responding: new Set<string>(),
++      });
++      const backspace = screen.getByRole('button', { name: 'Backspace' });
++      expect(backspace).toBeEnabled();
++      await user.click(backspace);
++      expect(send).toHaveBeenCalledWith(agent, {
++        type: 'send_keys', keys: ['Backspace'], activity_label: 'Backspace',
++      });
++      view.unmount();
++      const reader = render(TerminalView, {
++        agent,
++        allAgents: [agent],
++        frame: { paneId: agent.pane_id, content: 'ready', format: 'plain' },
++        responding: new Set<string>(),
++        readOnly: true,
++      });
++      expect(screen.getByRole('button', { name: 'Backspace' })).toBeDisabled();
++      reader.unmount();
++    } finally {
++      vi.restoreAllMocks();
++    }
++  });
++
++  it('subscribes controller history to pane frames without starving refreshes or polling in background', async () => {
++    vi.useFakeTimers();
++    const visibility = Object.getOwnPropertyDescriptor(document, 'visibilityState');
++    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
++    const agent: Agent = {
++      relay_id: 'fedora', relay_label: 'Fedora', raw_pane_id: 'w1:history', pane_id: 'fedora::w1:history',
++      project: 'relay', agent: 'codex', status: 'working',
++    };
++    const page = {
++      available: true, reason: '', entries: [], hasMore: false, total: 0,
++      fileTruncated: false, sourceCorrupt: false,
++    };
++    let resolveFirst: (value: typeof page) => void = () => {};
++    let resolveSecond: (value: typeof page) => void = () => {};
++    const first = new Promise<typeof page>((resolve) => { resolveFirst = resolve; });
++    const second = new Promise<typeof page>((resolve) => { resolveSecond = resolve; });
++    const history = vi.spyOn(relayStore, 'getConversationHistory')
++      .mockReturnValueOnce(first)
++      .mockReturnValueOnce(second)
++      .mockResolvedValue(page);
++    const readPane = vi.spyOn(relayStore, 'readPane').mockImplementation(() => undefined);
++    const watchPane = vi.spyOn(relayStore, 'watchPane').mockImplementation(() => undefined);
++    const unwatchPane = vi.spyOn(relayStore, 'unwatchPane').mockImplementation(() => undefined);
++    const lease = vi.spyOn(relayStore, 'leasePaneSize');
++    const releaseLease = vi.spyOn(relayStore, 'releasePaneSize');
++    try {
++      const view = render(ConversationHistory, {
++        agent,
++        readOnly: false,
++        frame: { paneId: agent.pane_id, content: 'one', format: 'plain' },
++      });
++      expect(readPane).toHaveBeenCalledWith(agent);
++      expect(watchPane).toHaveBeenCalledWith(agent);
++      expect(history).toHaveBeenCalledOnce();
++      await view.rerender({ frame: { paneId: agent.pane_id, content: 'two', format: 'plain' } });
++      await vi.advanceTimersByTimeAsync(500);
++      await view.rerender({ frame: { paneId: agent.pane_id, content: 'three', format: 'plain' } });
++      await vi.advanceTimersByTimeAsync(249);
++      expect(history).toHaveBeenCalledOnce();
++      await vi.advanceTimersByTimeAsync(1);
++      resolveFirst(page);
++      await vi.advanceTimersByTimeAsync(0);
++      expect(history).toHaveBeenCalledTimes(2);
++      await view.rerender({ frame: { paneId: agent.pane_id, content: 'four', format: 'plain' } });
++      await vi.advanceTimersByTimeAsync(500);
++      await view.rerender({ frame: { paneId: agent.pane_id, content: 'five', format: 'plain' } });
++      await vi.advanceTimersByTimeAsync(249);
++      expect(history).toHaveBeenCalledTimes(2);
++      await vi.advanceTimersByTimeAsync(1);
++      resolveSecond(page);
++      await vi.advanceTimersByTimeAsync(0);
++      expect(history).toHaveBeenCalledTimes(3);
++      await vi.advanceTimersByTimeAsync(3_499);
++      expect(history).toHaveBeenCalledTimes(3);
++      await vi.advanceTimersByTimeAsync(1);
++      expect(history).toHaveBeenCalledTimes(4);
++      await view.rerender({ frame: { paneId: agent.pane_id, content: 'six', format: 'plain' } });
++      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
++      document.dispatchEvent(new Event('visibilitychange'));
++      await vi.advanceTimersByTimeAsync(750);
++      expect(history).toHaveBeenCalledTimes(4);
++      await view.rerender({ frame: { paneId: agent.pane_id, content: 'seven', format: 'plain' } });
++      await vi.advanceTimersByTimeAsync(29_249);
++      expect(history).toHaveBeenCalledTimes(4);
++      await vi.advanceTimersByTimeAsync(1);
++      expect(history).toHaveBeenCalledTimes(5);
++      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
++      document.dispatchEvent(new Event('visibilitychange'));
++      expect(history).toHaveBeenCalledTimes(6);
++      view.unmount();
++      expect(unwatchPane).toHaveBeenCalledWith(agent);
++      const callsAfterUnmount = history.mock.calls.length;
++      await vi.advanceTimersByTimeAsync(30_000);
++      expect(history).toHaveBeenCalledTimes(callsAfterUnmount);
++      expect(lease).not.toHaveBeenCalled();
++      expect(releaseLease).not.toHaveBeenCalled();
++    } finally {
++      if (visibility) Object.defineProperty(document, 'visibilityState', visibility);
++      else Reflect.deleteProperty(document, 'visibilityState');
++      vi.useRealTimers();
++      vi.restoreAllMocks();
++    }
++  });
+ });
